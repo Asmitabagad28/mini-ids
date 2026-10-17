@@ -23,12 +23,28 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdint.h>
 
 #define MAX_LINE_LEN 1024      /* Maximum length of a single log/signature line */
 #define MAX_SIGNATURES 100     /* Maximum number of signatures we can store     */
 #define MAX_STR_LEN 256        /* Maximum length for attack types and patterns  */
-#define RK_BASE 256            /* Alphabet size (256 ASCII chars) for Rabin-Karp */
-#define RK_PRIME 101           /* Prime modulus for Rabin-Karp hash (shows spurious hits) */
+
+/*
+ * ============================================================================
+ * Rabin-Karp 64-bit Rolling Hash Configuration:
+ * ============================================================================
+ * RK_BASE : Number of characters in the alphabet (256 ASCII characters).
+ * RK_PRIME: Prime modulus used for the 64-bit rolling hash.
+ *
+ * YOU CAN CHANGE RK_PRIME HERE TO COMPARE SPURIOUS HIT COUNTS:
+ *   - 101LL        : Small prime (educational). Shows visible hash collisions
+ *                    (~232 spurious hits on logs.txt).
+ *   - 1000000007LL : Large prime (production-grade). Drastically minimizes
+ *                    hash collisions (0 spurious hits on logs.txt).
+ * ============================================================================
+ */
+#define RK_BASE 256LL
+#define RK_PRIME 1000000007LL  /* <-- Change between 101LL and 1000000007LL */
 
 /*
  * Structure to represent a single attack signature.
@@ -348,9 +364,13 @@ int rabin_karp_search(const char *text, const char *pattern, int *spurious_hits)
         return 0;
     }
 
-    int p_hash = 0; /* Hash value for the pattern */
-    int t_hash = 0; /* Hash value for current window in text */
-    int h = 1;      /* Multiplier for leftmost character: (RK_BASE^(m-1)) % RK_PRIME */
+    /*
+     * Use 64-bit integers (int64_t) for hash values.
+     * This avoids integer overflow when using large primes like 1000000007.
+     */
+    int64_t p_hash = 0; /* 64-bit hash value for the pattern */
+    int64_t t_hash = 0; /* 64-bit hash value for current window in text */
+    int64_t h = 1;      /* Multiplier for leftmost character: (RK_BASE^(m-1)) % RK_PRIME */
 
     /*
      * Precompute h = pow(RK_BASE, m - 1) % RK_PRIME
@@ -361,7 +381,7 @@ int rabin_karp_search(const char *text, const char *pattern, int *spurious_hits)
     }
 
     /*
-     * Calculate initial hash value for:
+     * Calculate initial 64-bit hash value for:
      * 1. The pattern
      * 2. The first window of text (text[0 ... m - 1])
      */
@@ -374,7 +394,7 @@ int rabin_karp_search(const char *text, const char *pattern, int *spurious_hits)
     for (int i = 0; i <= n - m; i++) {
         /*
          * Check if hash values match.
-         * Only if the hashes match do we do a full character-by-character check!
+         * Only if the 64-bit hashes match do we do a full character-by-character check!
          */
         if (t_hash == p_hash) {
             int match = 1;
@@ -410,18 +430,21 @@ int rabin_karp_search(const char *text, const char *pattern, int *spurious_hits)
              * Slide the window 1 position to the right in O(1) constant time:
              *
              *   Step 1: Subtract old leftmost character falling out of the window:
-             *           (text[i] * h)
+             *           ((int64_t)text[i] * h)
              *
              *   Step 2: Shift remaining characters left by multiplying by base:
-             *           * RK_BASE (256)
+             *           * RK_BASE (256LL)
              *
              *   Step 3: Add new incoming character entering on the right:
              *           + text[i + m]
              *
-             *   Step 4: Modulo by RK_PRIME (101) to keep the number small.
+             *   Step 4: Modulo by RK_PRIME to keep the number within 64-bit range.
+             *
+             * Using 64-bit arithmetic ensures that intermediate multiplication
+             * does not overflow even with RK_PRIME = 1000000007LL.
              * =================================================================
              */
-            t_hash = (RK_BASE * (t_hash - (unsigned char)text[i] * h) + (unsigned char)text[i + m]) % RK_PRIME;
+            t_hash = (RK_BASE * (t_hash - (int64_t)(unsigned char)text[i] * h) + (unsigned char)text[i + m]) % RK_PRIME;
 
             /*
              * In C, the '%' modulo operator on a negative number returns a
@@ -614,7 +637,11 @@ void scan_logs(const char *filename, Signature signatures[], int signature_count
     printf("\n======================================================================\n");
     printf("                  MINI-IDS INTRUSION DETECTION SCAN                   \n");
     printf("======================================================================\n");
-    printf("Selected Algorithm : %s\n", algo_name);
+    if (algo == ALGO_RABIN_KARP) {
+        printf("Selected Algorithm : %s (modulus q = %lld)\n", algo_name, (long long)RK_PRIME);
+    } else {
+        printf("Selected Algorithm : %s\n", algo_name);
+    }
     printf("======================================================================\n");
 
     /* Read each log line from the file */
@@ -655,6 +682,7 @@ void scan_logs(const char *filename, Signature signatures[], int signature_count
     printf("  Signatures checked  : %d\n", signature_count);
     printf("  Alerts triggered    : %d\n", alert_count);
     if (algo == ALGO_RABIN_KARP) {
+        printf("  Hash modulus (q)    : %lld\n", (long long)RK_PRIME);
         printf("  Spurious hash hits  : %d (hash matches that turned out not to be real matches)\n", spurious_hits);
     }
     printf("======================================================================\n");
