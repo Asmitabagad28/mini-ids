@@ -6,8 +6,10 @@
  * Description:
  *   A beginner-friendly, signature-based Intrusion Detection System written in C.
  *   It reads known attack patterns from "signatures.txt" and scans a web server
- *   log file ("logs.txt") using either Naive String Matching or the
- *   Knuth-Morris-Pratt (KMP) algorithm, selectable by the user at runtime.
+ *   log file ("logs.txt") using one of three algorithms chosen at runtime:
+ *     1. Naive String Matching
+ *     2. Knuth-Morris-Pratt (KMP) with LPS table
+ *     3. Rabin-Karp with Rolling Hash (tracks spurious hits / collisions)
  *   When a pattern is found inside a log line, an alert is printed with:
  *     - Line number
  *     - Attack type (e.g., SQL_INJECTION, XSS, PATH_TRAVERSAL)
@@ -25,6 +27,8 @@
 #define MAX_LINE_LEN 1024      /* Maximum length of a single log/signature line */
 #define MAX_SIGNATURES 100     /* Maximum number of signatures we can store     */
 #define MAX_STR_LEN 256        /* Maximum length for attack types and patterns  */
+#define RK_BASE 256            /* Alphabet size (256 ASCII chars) for Rabin-Karp */
+#define RK_PRIME 101           /* Prime modulus for Rabin-Karp hash (shows spurious hits) */
 
 /*
  * Structure to represent a single attack signature.
@@ -284,6 +288,156 @@ int kmp_search(const char *text, const char *pattern) {
 }
 
 /*
+ * ============================================================================
+ * Function: rabin_karp_search
+ * ============================================================================
+ *
+ * Searches for 'pattern' inside 'text' using the Rabin-Karp algorithm.
+ * Uses a rolling hash to check substrings in O(1) time per window shift.
+ * Also tracks 'spurious hits' (hash collisions where the hash matches but
+ * the actual characters do not).
+ *
+ * ----------------------------------------------------------------------------
+ * STUDENT EXPLANATION GUIDE: THE ROLLING HASH
+ * ----------------------------------------------------------------------------
+ * 1. The Core Idea:
+ *    Instead of comparing every character one by one (which is slow), we turn the
+ *    pattern into a single number called a "hash". Then we calculate the hash of
+ *    every window of text of the same length.
+ *    - If the hashes don't match -> The strings definitely don't match!
+ *    - If the hashes DO match    -> The strings MIGHT match, so we compare characters
+ *                                  to confirm.
+ *
+ * 2. The 3-Digit Number Analogy (The easiest way to understand Rolling Hash!):
+ *    Imagine you have the 3-digit number 456, and you want to slide over to 567:
+ *      Step 1: Subtract the old leading digit (4):
+ *              456 - (4 * 100) = 56
+ *      Step 2: Shift remaining digits to the left (multiply by base 10):
+ *              56 * 10 = 560
+ *      Step 3: Add the new incoming digit (7):
+ *              560 + 7 = 567!
+ *
+ *    That is EXACTLY what the rolling hash does in O(1) time!
+ *    - Instead of base 10, we use base 256 (for all ASCII characters).
+ *    - Instead of 100 (10^2), we use 'h' = (base^(m-1)) % prime.
+ *    - We use '% prime' at every step to prevent integer overflow.
+ *
+ * 3. What is a "Spurious Hit" (False Positive)?
+ *    Because we use '% prime' to keep numbers within integer bounds, two
+ *    completely different strings might occasionally produce the SAME hash number!
+ *    This is called a "hash collision".
+ *    When a collision happens, our character-by-character check fails. That false
+ *    alarm is counted as a "spurious hit".
+ *
+ * Time Complexity:
+ *   - Best & Average Case: O(n + m)
+ *   - Worst Case:          O(n * m) if many spurious hits occur.
+ * ============================================================================
+ */
+int rabin_karp_search(const char *text, const char *pattern, int *spurious_hits) {
+    int n = strlen(text);
+    int m = strlen(pattern);
+
+    /* If pattern is empty, nothing to search */
+    if (m == 0) {
+        return 0;
+    }
+
+    /* If pattern is longer than text, match is impossible */
+    if (m > n) {
+        return 0;
+    }
+
+    int p_hash = 0; /* Hash value for the pattern */
+    int t_hash = 0; /* Hash value for current window in text */
+    int h = 1;      /* Multiplier for leftmost character: (RK_BASE^(m-1)) % RK_PRIME */
+
+    /*
+     * Precompute h = pow(RK_BASE, m - 1) % RK_PRIME
+     * This represents the "place value" of the leading character in our window.
+     */
+    for (int i = 0; i < m - 1; i++) {
+        h = (h * RK_BASE) % RK_PRIME;
+    }
+
+    /*
+     * Calculate initial hash value for:
+     * 1. The pattern
+     * 2. The first window of text (text[0 ... m - 1])
+     */
+    for (int i = 0; i < m; i++) {
+        p_hash = (RK_BASE * p_hash + (unsigned char)pattern[i]) % RK_PRIME;
+        t_hash = (RK_BASE * t_hash + (unsigned char)text[i]) % RK_PRIME;
+    }
+
+    /* Slide the pattern window over the text one character at a time */
+    for (int i = 0; i <= n - m; i++) {
+        /*
+         * Check if hash values match.
+         * Only if the hashes match do we do a full character-by-character check!
+         */
+        if (t_hash == p_hash) {
+            int match = 1;
+
+            /* Check characters one by one */
+            for (int j = 0; j < m; j++) {
+                if (text[i + j] != pattern[j]) {
+                    match = 0;
+                    break;
+                }
+            }
+
+            if (match) {
+                return 1; /* Real match found! */
+            } else {
+                /*
+                 * SPURIOUS HIT (Hash collision):
+                 * Hashes matched, but actual strings did not!
+                 * We record this false alarm and continue scanning.
+                 */
+                if (spurious_hits != NULL) {
+                    (*spurious_hits)++;
+                }
+            }
+        }
+
+        /* Calculate hash value for the NEXT window (rolling hash update) */
+        if (i < n - m) {
+            /*
+             * =================================================================
+             * ROLLING HASH UPDATE (in simple words):
+             * =================================================================
+             * Slide the window 1 position to the right in O(1) constant time:
+             *
+             *   Step 1: Subtract old leftmost character falling out of the window:
+             *           (text[i] * h)
+             *
+             *   Step 2: Shift remaining characters left by multiplying by base:
+             *           * RK_BASE (256)
+             *
+             *   Step 3: Add new incoming character entering on the right:
+             *           + text[i + m]
+             *
+             *   Step 4: Modulo by RK_PRIME (101) to keep the number small.
+             * =================================================================
+             */
+            t_hash = (RK_BASE * (t_hash - (unsigned char)text[i] * h) + (unsigned char)text[i + m]) % RK_PRIME;
+
+            /*
+             * In C, the '%' modulo operator on a negative number returns a
+             * negative value. If t_hash became negative after subtraction,
+             * adding RK_PRIME wraps it back into the positive range [0, RK_PRIME - 1].
+             */
+            if (t_hash < 0) {
+                t_hash += RK_PRIME;
+            }
+        }
+    }
+
+    return 0; /* Pattern not found */
+}
+
+/*
  * Function: load_signatures
  * -------------------------
  * Reads attack signatures from a file formatted as "AttackType|pattern".
@@ -338,14 +492,15 @@ int load_signatures(const char *filename, Signature signatures[], int max_signat
  */
 typedef enum {
     ALGO_NAIVE = 1,
-    ALGO_KMP = 2
+    ALGO_KMP = 2,
+    ALGO_RABIN_KARP = 3
 } AlgorithmType;
 
 /*
  * Helper function: string_equals_ignore_case
  * -----------------------------------------
  * Performs a case-insensitive string comparison.
- * Allows matching user input like "naive", "Naive", "kmp", "KMP".
+ * Allows matching user input like "naive", "Naive", "kmp", "KMP", "rabin-karp".
  */
 int string_equals_ignore_case(const char *s1, const char *s2) {
     while (*s1 && *s2) {
@@ -365,8 +520,9 @@ int string_equals_ignore_case(const char *s1, const char *s2) {
  *
  * It supports two convenient methods:
  * 1. Command-line argument:
- *      ./mini_ids naive   or   ./mini_ids 1
- *      ./mini_ids kmp     or   ./mini_ids 2
+ *      ./mini_ids naive        or   ./mini_ids 1
+ *      ./mini_ids kmp          or   ./mini_ids 2
+ *      ./mini_ids rabin-karp   or   ./mini_ids 3
  * 2. Interactive runtime menu:
  *      If no argument is given, it asks the user to choose.
  */
@@ -379,6 +535,14 @@ AlgorithmType choose_algorithm(int argc, char *argv[]) {
         if (strcmp(argv[1], "2") == 0 || string_equals_ignore_case(argv[1], "kmp")) {
             return ALGO_KMP;
         }
+        if (strcmp(argv[1], "3") == 0 ||
+            string_equals_ignore_case(argv[1], "rabin-karp") ||
+            string_equals_ignore_case(argv[1], "rabin-krap") ||
+            string_equals_ignore_case(argv[1], "rabin") ||
+            string_equals_ignore_case(argv[1], "karp") ||
+            string_equals_ignore_case(argv[1], "rk")) {
+            return ALGO_RABIN_KARP;
+        }
         printf("Notice: Unrecognized argument '%s'. Please choose from the menu:\n\n", argv[1]);
     }
 
@@ -389,7 +553,8 @@ AlgorithmType choose_algorithm(int argc, char *argv[]) {
         printf("Choose String Matching Algorithm:\n");
         printf("  [1] Naive String Matching Algorithm\n");
         printf("  [2] Knuth-Morris-Pratt (KMP) Algorithm with LPS Table\n");
-        printf("Enter your choice (1 or 2, or 'naive'/'kmp'): ");
+        printf("  [3] Rabin-Karp Algorithm with Rolling Hash\n");
+        printf("Enter your choice (1, 2, or 3): ");
         fflush(stdout);
 
         if (fgets(input, sizeof(input), stdin) == NULL) {
@@ -404,8 +569,15 @@ AlgorithmType choose_algorithm(int argc, char *argv[]) {
             return ALGO_NAIVE;
         } else if (strcmp(input, "2") == 0 || string_equals_ignore_case(input, "kmp")) {
             return ALGO_KMP;
+        } else if (strcmp(input, "3") == 0 ||
+                   string_equals_ignore_case(input, "rabin-karp") ||
+                   string_equals_ignore_case(input, "rabin-krap") ||
+                   string_equals_ignore_case(input, "rabin") ||
+                   string_equals_ignore_case(input, "karp") ||
+                   string_equals_ignore_case(input, "rk")) {
+            return ALGO_RABIN_KARP;
         } else {
-            printf("Invalid selection \"%s\". Please enter 1 (Naive) or 2 (KMP).\n\n", input);
+            printf("Invalid selection \"%s\". Please enter 1 (Naive), 2 (KMP), or 3 (Rabin-Karp).\n\n", input);
         }
     }
 }
@@ -415,7 +587,7 @@ AlgorithmType choose_algorithm(int argc, char *argv[]) {
  * -------------------
  * Reads log lines one by one from "logs.txt".
  * For each line, it scans against every loaded signature using the
- * selected algorithm (Naive or KMP).
+ * selected algorithm (Naive, KMP, or Rabin-Karp).
  * Whenever a match is found, an alert is printed.
  */
 void scan_logs(const char *filename, Signature signatures[], int signature_count, AlgorithmType algo) {
@@ -428,10 +600,16 @@ void scan_logs(const char *filename, Signature signatures[], int signature_count
     char line[MAX_LINE_LEN];
     int line_number = 0;
     int alert_count = 0;
+    int spurious_hits = 0; /* Counts hash collisions for Rabin-Karp */
 
-    const char *algo_name = (algo == ALGO_KMP) 
-        ? "Knuth-Morris-Pratt (KMP)" 
-        : "Naive String Matching";
+    const char *algo_name;
+    if (algo == ALGO_KMP) {
+        algo_name = "Knuth-Morris-Pratt (KMP)";
+    } else if (algo == ALGO_RABIN_KARP) {
+        algo_name = "Rabin-Karp (Rolling Hash)";
+    } else {
+        algo_name = "Naive String Matching";
+    }
 
     printf("\n======================================================================\n");
     printf("                  MINI-IDS INTRUSION DETECTION SCAN                   \n");
@@ -450,6 +628,8 @@ void scan_logs(const char *filename, Signature signatures[], int signature_count
 
             if (algo == ALGO_KMP) {
                 matched = kmp_search(line, signatures[i].pattern);
+            } else if (algo == ALGO_RABIN_KARP) {
+                matched = rabin_karp_search(line, signatures[i].pattern, &spurious_hits);
             } else {
                 matched = naive_search(line, signatures[i].pattern);
             }
@@ -470,10 +650,13 @@ void scan_logs(const char *filename, Signature signatures[], int signature_count
     /* Print scan summary */
     printf("======================================================================\n");
     printf("Scan Complete!\n");
-    printf("  Algorithm used      : %s\n", (algo == ALGO_KMP) ? "KMP" : "Naive");
+    printf("  Algorithm used      : %s\n", (algo == ALGO_KMP) ? "KMP" : (algo == ALGO_RABIN_KARP) ? "Rabin-Karp" : "Naive");
     printf("  Total lines scanned : %d\n", line_number);
     printf("  Signatures checked  : %d\n", signature_count);
     printf("  Alerts triggered    : %d\n", alert_count);
+    if (algo == ALGO_RABIN_KARP) {
+        printf("  Spurious hash hits  : %d (hash matches that turned out not to be real matches)\n", spurious_hits);
+    }
     printf("======================================================================\n");
 }
 
