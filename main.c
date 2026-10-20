@@ -24,6 +24,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdint.h>
+#include <time.h>
 
 #define MAX_LINE_LEN 1024      /* Maximum length of a single log/signature line */
 #define MAX_SIGNATURES 100     /* Maximum number of signatures we can store     */
@@ -45,6 +46,18 @@
  */
 #define RK_BASE 256LL
 #define RK_PRIME 1000000007LL  /* <-- Change between 101LL and 1000000007LL */
+
+/*
+ * Global comparison counter:
+ * --------------------------
+ * long long is used because the worst case can be huge
+ * (e.g. 100 comparisons x 1,000,000 text characters = 100,000,000).
+ *
+ * It is incremented ONCE every time naive_search() or kmp_search()
+ * compares one text character against one pattern character.
+ * The caller resets it to 0 right before starting a search.
+ */
+long long comparisons = 0;
 
 /*
  * Structure to represent a single attack signature.
@@ -108,6 +121,7 @@ int naive_search(const char *text, const char *pattern) {
 
         /* Compare pattern characters with text characters */
         for (j = 0; j < m; j++) {
+            comparisons++; /* Count this text-vs-pattern character comparison */
             if (text[i + j] != pattern[j]) {
                 break; /* Character mismatch, stop checking this position */
             }
@@ -267,6 +281,7 @@ int kmp_search(const char *text, const char *pattern) {
     int *lps = (int *)malloc(m * sizeof(int));
     if (lps == NULL) {
         /* Fall back safely to naive search if memory allocation fails */
+        comparisons = 0; /* Reset the counter before this search */
         return naive_search(text, pattern);
     }
 
@@ -279,6 +294,7 @@ int kmp_search(const char *text, const char *pattern) {
     int found = 0;
 
     while (i < n) {
+        comparisons++; /* Count this text-vs-pattern character comparison */
         if (text[i] == pattern[j]) {
             i++;
             j++;
@@ -288,13 +304,21 @@ int kmp_search(const char *text, const char *pattern) {
         if (j == m) {
             found = 1;
             break; /* Pattern detected in this log line */
-        } else if (i < n && text[i] != pattern[j]) {
-            /* Mismatch after j matches */
-            if (j != 0) {
-                /* Use LPS table to avoid backtracking 'i' */
-                j = lps[j - 1];
-            } else {
-                i++;
+        } else if (i < n) {
+            /*
+             * Same check as before: text[i] != pattern[j].
+             * It is only done when i < n, and we count it as another
+             * character comparison because it really happens here.
+             */
+            comparisons++;
+            if (text[i] != pattern[j]) {
+                /* Mismatch after j matches */
+                if (j != 0) {
+                    /* Use LPS table to avoid backtracking 'i' */
+                    j = lps[j - 1];
+                } else {
+                    i++;
+                }
             }
         }
     }
@@ -516,7 +540,9 @@ int load_signatures(const char *filename, Signature signatures[], int max_signat
 typedef enum {
     ALGO_NAIVE = 1,
     ALGO_KMP = 2,
-    ALGO_RABIN_KARP = 3
+    ALGO_RABIN_KARP = 3,
+    ALGO_BENCHMARK = 4,
+    ALGO_WORST_CASE = 5
 } AlgorithmType;
 
 /*
@@ -539,13 +565,15 @@ int string_equals_ignore_case(const char *s1, const char *s2) {
 /*
  * Function: choose_algorithm
  * --------------------------
- * Determines which string matching algorithm to use at runtime.
+ * Determines which string matching algorithm or mode to use at runtime.
  *
  * It supports two convenient methods:
  * 1. Command-line argument:
  *      ./mini_ids naive        or   ./mini_ids 1
  *      ./mini_ids kmp          or   ./mini_ids 2
  *      ./mini_ids rabin-karp   or   ./mini_ids 3
+ *      ./mini_ids benchmark    or   ./mini_ids 4
+ *      ./mini_ids worstcase    or   ./mini_ids 5
  * 2. Interactive runtime menu:
  *      If no argument is given, it asks the user to choose.
  */
@@ -566,6 +594,22 @@ AlgorithmType choose_algorithm(int argc, char *argv[]) {
             string_equals_ignore_case(argv[1], "rk")) {
             return ALGO_RABIN_KARP;
         }
+        if (strcmp(argv[1], "4") == 0 ||
+            string_equals_ignore_case(argv[1], "benchmark") ||
+            string_equals_ignore_case(argv[1], "--benchmark") ||
+            string_equals_ignore_case(argv[1], "-b") ||
+            string_equals_ignore_case(argv[1], "bench")) {
+            return ALGO_BENCHMARK;
+        }
+        if (strcmp(argv[1], "5") == 0 ||
+            string_equals_ignore_case(argv[1], "worstcase") ||
+            string_equals_ignore_case(argv[1], "worst-case") ||
+            string_equals_ignore_case(argv[1], "--worstcase") ||
+            string_equals_ignore_case(argv[1], "--worst-case") ||
+            string_equals_ignore_case(argv[1], "worst") ||
+            string_equals_ignore_case(argv[1], "wc")) {
+            return ALGO_WORST_CASE;
+        }
         printf("Notice: Unrecognized argument '%s'. Please choose from the menu:\n\n", argv[1]);
     }
 
@@ -573,11 +617,13 @@ AlgorithmType choose_algorithm(int argc, char *argv[]) {
     char input[64];
     while (1) {
         printf("----------------------------------------------------------------------\n");
-        printf("Choose String Matching Algorithm:\n");
+        printf("Choose String Matching Algorithm / Mode:\n");
         printf("  [1] Naive String Matching Algorithm\n");
         printf("  [2] Knuth-Morris-Pratt (KMP) Algorithm with LPS Table\n");
         printf("  [3] Rabin-Karp Algorithm with Rolling Hash\n");
-        printf("Enter your choice (1, 2, or 3): ");
+        printf("  [4] Benchmark Mode (Log files 1K to 1M lines)\n");
+        printf("  [5] Worst-Case Benchmark Mode (Text of repeating 'A's + pattern 'A...AB')\n");
+        printf("Enter your choice (1, 2, 3, 4, or 5): ");
         fflush(stdout);
 
         if (fgets(input, sizeof(input), stdin) == NULL) {
@@ -599,8 +645,22 @@ AlgorithmType choose_algorithm(int argc, char *argv[]) {
                    string_equals_ignore_case(input, "karp") ||
                    string_equals_ignore_case(input, "rk")) {
             return ALGO_RABIN_KARP;
+        } else if (strcmp(input, "4") == 0 ||
+                   string_equals_ignore_case(input, "benchmark") ||
+                   string_equals_ignore_case(input, "--benchmark") ||
+                   string_equals_ignore_case(input, "-b") ||
+                   string_equals_ignore_case(input, "bench")) {
+            return ALGO_BENCHMARK;
+        } else if (strcmp(input, "5") == 0 ||
+                   string_equals_ignore_case(input, "worstcase") ||
+                   string_equals_ignore_case(input, "worst-case") ||
+                   string_equals_ignore_case(input, "--worstcase") ||
+                   string_equals_ignore_case(input, "--worst-case") ||
+                   string_equals_ignore_case(input, "worst") ||
+                   string_equals_ignore_case(input, "wc")) {
+            return ALGO_WORST_CASE;
         } else {
-            printf("Invalid selection \"%s\". Please enter 1 (Naive), 2 (KMP), or 3 (Rabin-Karp).\n\n", input);
+            printf("Invalid selection \"%s\". Please enter 1, 2, 3, 4, or 5.\n\n", input);
         }
     }
 }
@@ -654,10 +714,12 @@ void scan_logs(const char *filename, Signature signatures[], int signature_count
             int matched = 0;
 
             if (algo == ALGO_KMP) {
+                comparisons = 0; /* Reset the counter before this search */
                 matched = kmp_search(line, signatures[i].pattern);
             } else if (algo == ALGO_RABIN_KARP) {
                 matched = rabin_karp_search(line, signatures[i].pattern, &spurious_hits);
             } else {
+                comparisons = 0; /* Reset the counter before this search */
                 matched = naive_search(line, signatures[i].pattern);
             }
 
@@ -688,9 +750,459 @@ void scan_logs(const char *filename, Signature signatures[], int signature_count
     printf("======================================================================\n");
 }
 
+/*
+ * Structure to store benchmark timing results for a specific log size.
+ */
+typedef struct {
+    int lines;         /* Number of log lines tested */
+    double naive_ms;   /* Time in milliseconds for Naive search */
+    double kmp_ms;     /* Time in milliseconds for KMP search */
+    double rk_ms;      /* Time in milliseconds for Rabin-Karp search */
+} BenchmarkResult;
+
+/*
+ * Function: scan_benchmark
+ * ------------------------
+ * Scans a test log file against all loaded signatures using the specified algorithm,
+ * WITHOUT printing alerts to stdout.
+ *
+ * Why we do not print alerts during benchmark:
+ *   Printing thousands of alerts to the console would cause terminal I/O bottlenecks,
+ *   obscuring the actual algorithmic performance differences we want to measure.
+ *
+ * Returns:
+ *   Total count of alerts triggered (retained to prevent compiler dead code elimination).
+ */
+int scan_benchmark(const char *filename, Signature signatures[], int sig_count, AlgorithmType algo) {
+    FILE *file = fopen(filename, "r");
+    if (file == NULL) {
+        printf("Error: Could not open test log file '%s'\n", filename);
+        return -1;
+    }
+
+    char line[MAX_LINE_LEN];
+    int alert_count = 0;
+    int spurious_hits = 0; /* Tracked for Rabin-Karp */
+
+    /* Read each log line from the file */
+    while (fgets(line, sizeof(line), file) != NULL) {
+        strip_newline(line);
+
+        /* Scan this line against every attack signature */
+        for (int i = 0; i < sig_count; i++) {
+            int matched = 0;
+
+            if (algo == ALGO_NAIVE) {
+                comparisons = 0; /* Reset the counter before this search */
+                matched = naive_search(line, signatures[i].pattern);
+            } else if (algo == ALGO_KMP) {
+                comparisons = 0; /* Reset the counter before this search */
+                matched = kmp_search(line, signatures[i].pattern);
+            } else if (algo == ALGO_RABIN_KARP) {
+                matched = rabin_karp_search(line, signatures[i].pattern, &spurious_hits);
+            }
+
+            if (matched) {
+                alert_count++;
+            }
+        }
+    }
+
+    fclose(file);
+    return alert_count;
+}
+
+/*
+ * Function: create_test_log
+ * -------------------------
+ * Generates a test log file with 'target_lines' lines by repeating the
+ * sample lines from the source log file in circular order.
+ *
+ * Parameters:
+ *   filename     - Output file path (e.g., "test_logs_1000.txt")
+ *   sample_lines - Array of strings containing the source log lines
+ *   num_samples  - Number of lines in sample_lines
+ *   target_lines - Desired number of lines to write (1000, 10000, etc.)
+ *
+ * Returns:
+ *   1 on success, 0 on failure.
+ */
+int create_test_log(const char *filename, char *sample_lines[], int num_samples, int target_lines) {
+    FILE *out = fopen(filename, "w");
+    if (out == NULL) {
+        printf("Error: Could not create test log file '%s'\n", filename);
+        return 0;
+    }
+
+    /* Repeat sample lines until target_lines lines have been written */
+    for (int i = 0; i < target_lines; i++) {
+        fputs(sample_lines[i % num_samples], out);
+    }
+
+    fclose(out);
+    return 1;
+}
+
+/*
+ * Function: run_benchmark
+ * -----------------------
+ * Executes the performance benchmark across 1,000, 10,000, 100,000,
+ * and 1,000,000 log lines.
+ *
+ * Workflow:
+ *   1. Reads sample lines from "logs.text" (or "logs.txt").
+ *   2. Generates test log files by repeating lines for each target size.
+ *   3. Measures CPU time with clock() for Naive, KMP, and Rabin-Karp searches.
+ *   4. Prints a formatted comparison table of milliseconds per algorithm.
+ *   5. Saves the table to "result.csv".
+ */
+void run_benchmark(Signature signatures[], int sig_count) {
+    /* Step 1: Open source log file (checks logs.text first, then logs.txt) */
+    const char *src_filename = "logs.text";
+    FILE *src_file = fopen("logs.text", "r");
+    if (src_file == NULL) {
+        src_file = fopen("logs.txt", "r");
+        if (src_file != NULL) {
+            src_filename = "logs.txt";
+        }
+    }
+
+    if (src_file == NULL) {
+        printf("Error: Could not open source log file ('logs.text' or 'logs.txt') to generate test logs.\n");
+        return;
+    }
+
+    /* Load all sample lines into memory */
+    #define MAX_SAMPLE_LINES 10000
+    char *sample_lines[MAX_SAMPLE_LINES];
+    int num_samples = 0;
+    char buffer[MAX_LINE_LEN];
+
+    while (fgets(buffer, sizeof(buffer), src_file) != NULL && num_samples < MAX_SAMPLE_LINES) {
+        /* Ensure each line ends with a newline character */
+        int len = strlen(buffer);
+        if (len > 0 && buffer[len - 1] != '\n') {
+            if (len < MAX_LINE_LEN - 1) {
+                buffer[len] = '\n';
+                buffer[len + 1] = '\0';
+                len++;
+            }
+        }
+
+        sample_lines[num_samples] = (char *)malloc(len + 1);
+        if (sample_lines[num_samples] == NULL) {
+            printf("Error: Memory allocation failed while loading sample log lines.\n");
+            fclose(src_file);
+            for (int j = 0; j < num_samples; j++) {
+                free(sample_lines[j]);
+            }
+            return;
+        }
+        strcpy(sample_lines[num_samples], buffer);
+        num_samples++;
+    }
+    fclose(src_file);
+
+    if (num_samples == 0) {
+        printf("Error: Source log file '%s' is empty.\n", src_filename);
+        return;
+    }
+
+    printf("=========================================================================\n");
+    printf("                  MINI-IDS PERFORMANCE BENCHMARK MODE                   \n");
+    printf("=========================================================================\n");
+    printf("Loaded %d sample lines from '%s'.\n", num_samples, src_filename);
+    printf("Testing sizes: 1,000, 10,000, 100,000, and 1,000,000 lines.\n");
+    printf("Timing Naive, KMP, and Rabin-Karp algorithms with clock()...\n");
+    printf("=========================================================================\n\n");
+
+    const int test_sizes[] = {1000, 10000, 100000, 1000000};
+    const char *size_labels[] = {"1,000", "10,000", "100,000", "1,000,000"};
+    int num_sizes = sizeof(test_sizes) / sizeof(test_sizes[0]);
+    BenchmarkResult results[4];
+
+    /* Step 2: Generate test files and benchmark each size */
+    for (int s = 0; s < num_sizes; s++) {
+        int target = test_sizes[s];
+        results[s].lines = target;
+
+        char filename[64];
+        snprintf(filename, sizeof(filename), "test_logs_%d.txt", target);
+
+        printf("[%d/%d] Creating test log file '%s' (%s lines)... ",
+               s + 1, num_sizes, filename, size_labels[s]);
+        fflush(stdout);
+
+        if (!create_test_log(filename, sample_lines, num_samples, target)) {
+            printf("Failed!\n");
+            continue;
+        }
+        printf("Done.\n");
+
+        /* Benchmark Naive Search */
+        printf("      Running Naive search      ... ");
+        fflush(stdout);
+        clock_t start_naive = clock();
+        scan_benchmark(filename, signatures, sig_count, ALGO_NAIVE);
+        clock_t end_naive = clock();
+        results[s].naive_ms = ((double)(end_naive - start_naive) * 1000.0) / CLOCKS_PER_SEC;
+        printf("%.2f ms\n", results[s].naive_ms);
+
+        /* Benchmark KMP Search */
+        printf("      Running KMP search        ... ");
+        fflush(stdout);
+        clock_t start_kmp = clock();
+        scan_benchmark(filename, signatures, sig_count, ALGO_KMP);
+        clock_t end_kmp = clock();
+        results[s].kmp_ms = ((double)(end_kmp - start_kmp) * 1000.0) / CLOCKS_PER_SEC;
+        printf("%.2f ms\n", results[s].kmp_ms);
+
+        /* Benchmark Rabin-Karp Search */
+        printf("      Running Rabin-Karp search ... ");
+        fflush(stdout);
+        clock_t start_rk = clock();
+        scan_benchmark(filename, signatures, sig_count, ALGO_RABIN_KARP);
+        clock_t end_rk = clock();
+        results[s].rk_ms = ((double)(end_rk - start_rk) * 1000.0) / CLOCKS_PER_SEC;
+        printf("%.2f ms\n\n", results[s].rk_ms);
+    }
+
+    /* Free dynamically allocated sample lines */
+    for (int j = 0; j < num_samples; j++) {
+        free(sample_lines[j]);
+    }
+
+    /* Step 3: Print formatted comparison table of milliseconds per algorithm per size */
+    printf("=========================================================================\n");
+    printf("              BENCHMARK EXECUTION TIME SUMMARY (Milliseconds)            \n");
+    printf("=========================================================================\n");
+    printf("| %-12s | %-16s | %-16s | %-16s |\n", "Log Lines", "Naive (ms)", "KMP (ms)", "Rabin-Karp (ms)");
+    printf("+--------------+------------------+------------------+------------------+\n");
+    for (int s = 0; s < num_sizes; s++) {
+        printf("| %-12s | %16.2f | %16.2f | %16.2f |\n",
+               size_labels[s],
+               results[s].naive_ms,
+               results[s].kmp_ms,
+               results[s].rk_ms);
+    }
+    printf("+--------------+------------------+------------------+------------------+\n\n");
+
+    /* Step 4: Save table to result.csv */
+    const char *csv_filename = "result.csv";
+    FILE *csv_file = fopen(csv_filename, "w");
+    if (csv_file == NULL) {
+        printf("Error: Could not open '%s' for writing.\n", csv_filename);
+    } else {
+        fprintf(csv_file, "Lines,Naive (ms),KMP (ms),Rabin-Karp (ms)\n");
+        for (int s = 0; s < num_sizes; s++) {
+            fprintf(csv_file, "%d,%.2f,%.2f,%.2f\n",
+                    results[s].lines,
+                    results[s].naive_ms,
+                    results[s].kmp_ms,
+                    results[s].rk_ms);
+        }
+        fclose(csv_file);
+        printf("Successfully saved benchmark table to '%s'.\n", csv_filename);
+    }
+    printf("=========================================================================\n");
+}
+
+/*
+ * Structure to store worst-case benchmark timing results.
+ */
+typedef struct {
+    int size;                    /* Length of text (n copies of 'A') */
+    double naive_ms;             /* Average time in milliseconds for Naive search */
+    double kmp_ms;               /* Average time in milliseconds for KMP search */
+    double rk_ms;                /* Average time in milliseconds for Rabin-Karp search */
+    long long naive_comparisons; /* Character comparisons made by Naive search  */
+    long long kmp_comparisons;   /* Character comparisons made by KMP search     */
+} WorstCaseResult;
+
+/*
+ * Function: run_worst_case_benchmark
+ * ----------------------------------
+ * Tests the theoretical worst-case performance of Naive string matching
+ * compared to KMP and Rabin-Karp.
+ *
+ * Worst-Case Setup:
+ *   - Pattern : 100 'A' characters followed by 1 'B' (length 101)
+ *   - Text    : n consecutive copies of 'A'
+ *
+ * Why this is the worst-case for Naive:
+ *   At each shift i in the text, Naive compares characters one by one.
+ *   The first 100 characters match ('A' == 'A'), but the 101st character
+ *   fails ('A' != 'B').
+ *   Naive then slides forward by only 1 character and re-evaluates all 100
+ *   'A's again! This results in O(n * m) operations (~100 * n comparisons).
+ *
+ * In contrast:
+ *   - KMP uses its LPS table to never backtrack in text -> O(n + m) linear time.
+ *   - Rabin-Karp updates rolling hash in O(1) constant time without collisions -> O(n + m).
+ *
+ * How it runs:
+ *   - Each algorithm is run 5 times per size and the AVERAGE time is reported.
+ *   - The global 'comparisons' counter is reset before every search, so the
+ *     table and worstcase.csv also show how many character comparisons the
+ *     Naive and KMP searches performed.
+ *
+ * Tested Sizes:
+ *   n = 10,000, 50,000, 100,000, 200,000, and 1,000,000 characters.
+ *
+ * Output:
+ *   Prints an aligned ASCII table to stdout and saves results to "worstcase.csv".
+ */
+void run_worst_case_benchmark(void) {
+    /*
+     * Build the pattern in code: 100 'A' characters followed by one 'B'
+     * (length 101). Building it in code is simpler and safer than typing
+     * 100 'A's inside a string literal.
+     */
+    char pattern_buf[103];
+    memset(pattern_buf, 'A', 100);
+    pattern_buf[100] = 'B';
+    pattern_buf[101] = '\0';
+    const char *pattern = pattern_buf;
+
+    /* Number of times each algorithm is run per size (average time is reported) */
+    const int runs = 5;
+
+    /*
+     * Benchmark sizes: 10,000, 50,000, 100,000, 200,000, and 1,000,000.
+     * Note: 100,000 and 1,000,000 are both included to cover the 100K progression
+     * and the 1M scale.
+     */
+    const int sizes[] = {10000, 50000, 100000, 200000, 1000000};
+    const char *size_labels[] = {"10,000", "50,000", "100,000", "200,000", "1,000,000"};
+    int num_sizes = sizeof(sizes) / sizeof(sizes[0]);
+    WorstCaseResult results[5];
+
+    printf("=========================================================================\n");
+    printf("              MINI-IDS WORST-CASE PERFORMANCE BENCHMARK                 \n");
+    printf("=========================================================================\n");
+    printf("Pattern : 100 'A' characters followed by 'B' (length 101)\n");
+    printf("Text    : n copies of 'A' (forces Naive to match 100 chars then fail)\n");
+    printf("Sizes   : 10,000, 50,000, 100,000, 200,000, and 1,000,000 characters\n");
+    printf("Runs    : each algorithm runs %d times per size, AVERAGE time reported\n", runs);
+    printf("Timing   : clock() in milliseconds, plus comparison counts for Naive/KMP\n");
+    printf("=========================================================================\n\n");
+
+    for (int s = 0; s < num_sizes; s++) {
+        int n = sizes[s];
+        results[s].size = n;
+
+        printf("[%d/%d] Testing n = %s characters...\n", s + 1, num_sizes, size_labels[s]);
+
+        /* Allocate text buffer and fill with 'A' */
+        char *text = (char *)malloc(n + 1);
+        if (text == NULL) {
+            printf("Error: Memory allocation failed for size %d\n", n);
+            continue;
+        }
+        memset(text, 'A', n);
+        text[n] = '\0';
+
+        /* --- Run every algorithm 'runs' times and average the times --- */
+        double naive_total = 0.0, kmp_total = 0.0, rk_total = 0.0;
+        long long naive_comps = 0, kmp_comps = 0;
+
+        printf("      Running each algorithm %d times...\n", runs);
+
+        for (int r = 0; r < runs; r++) {
+            /* 1. Benchmark Naive Search (counter reset before the search) */
+            comparisons = 0;
+            clock_t t0 = clock();
+            volatile int match_naive = naive_search(text, pattern);
+            clock_t t1 = clock();
+            (void)match_naive;
+            naive_total += ((double)(t1 - t0) * 1000.0) / CLOCKS_PER_SEC;
+            naive_comps = comparisons; /* Same input -> same count every run */
+
+            /* 2. Benchmark KMP Search (counter reset before the search) */
+            comparisons = 0;
+            t0 = clock();
+            volatile int match_kmp = kmp_search(text, pattern);
+            t1 = clock();
+            (void)match_kmp;
+            kmp_total += ((double)(t1 - t0) * 1000.0) / CLOCKS_PER_SEC;
+            kmp_comps = comparisons; /* Same input -> same count every run */
+
+            /* 3. Benchmark Rabin-Karp Search (no comparison counting for RK) */
+            int spurious_hits = 0;
+            t0 = clock();
+            volatile int match_rk = rabin_karp_search(text, pattern, &spurious_hits);
+            t1 = clock();
+            (void)match_rk;
+            rk_total += ((double)(t1 - t0) * 1000.0) / CLOCKS_PER_SEC;
+        }
+
+        /* Store the AVERAGE time and the comparison counts for this size */
+        results[s].naive_ms = naive_total / runs;
+        results[s].kmp_ms = kmp_total / runs;
+        results[s].rk_ms = rk_total / runs;
+        results[s].naive_comparisons = naive_comps;
+        results[s].kmp_comparisons = kmp_comps;
+
+        printf("        Naive      : %10.2f ms avg | %lld comparisons\n",
+               results[s].naive_ms, results[s].naive_comparisons);
+        printf("        KMP        : %10.2f ms avg | %lld comparisons\n",
+               results[s].kmp_ms, results[s].kmp_comparisons);
+        printf("        Rabin-Karp : %10.2f ms avg\n\n", results[s].rk_ms);
+
+        free(text);
+    }
+
+    /* Print formatted ASCII table */
+    printf("=========================================================================\n");
+    printf("            WORST-CASE BENCHMARK EXECUTION TIME SUMMARY (ms)            \n");
+    printf("=========================================================================\n");
+    printf("| %-15s | %-16s | %-16s | %-16s | %-16s | %-16s |\n",
+           "Text Size (n)", "Naive (ms)", "KMP (ms)", "Rabin-Karp (ms)",
+           "Naive Compares", "KMP Compares");
+    printf("+-----------------+------------------+------------------+------------------+------------------+------------------+\n");
+    for (int s = 0; s < num_sizes; s++) {
+        printf("| %-15s | %16.2f | %16.2f | %16.2f | %16lld | %16lld |\n",
+               size_labels[s],
+               results[s].naive_ms,
+               results[s].kmp_ms,
+               results[s].rk_ms,
+               results[s].naive_comparisons,
+               results[s].kmp_comparisons);
+    }
+    printf("+-----------------+------------------+------------------+------------------+------------------+------------------+\n\n");
+
+    /* Save table to worstcase.csv */
+    const char *csv_filename = "worstcase.csv";
+    FILE *csv_file = fopen(csv_filename, "w");
+    if (csv_file == NULL) {
+        printf("Error: Could not open '%s' for writing.\n", csv_filename);
+    } else {
+        fprintf(csv_file, "Size,Naive (ms),KMP (ms),Rabin-Karp (ms),Naive Comparisons,KMP Comparisons\n");
+        for (int s = 0; s < num_sizes; s++) {
+            fprintf(csv_file, "%d,%.2f,%.2f,%.2f,%lld,%lld\n",
+                    results[s].size,
+                    results[s].naive_ms,
+                    results[s].kmp_ms,
+                    results[s].rk_ms,
+                    results[s].naive_comparisons,
+                    results[s].kmp_comparisons);
+        }
+        fclose(csv_file);
+        printf("Successfully saved worst-case benchmark table to '%s'.\n", csv_filename);
+    }
+    printf("=========================================================================\n");
+}
+
 int main(int argc, char *argv[]) {
     const char *sig_file = "signatures.txt";
     const char *log_file = "logs.txt";
+
+    /* If logs.text exists, prefer it, otherwise use logs.txt */
+    FILE *check_log = fopen("logs.text", "r");
+    if (check_log != NULL) {
+        log_file = "logs.text";
+        fclose(check_log);
+    }
 
     Signature signatures[MAX_SIGNATURES];
 
@@ -702,11 +1214,17 @@ int main(int argc, char *argv[]) {
 
     printf("Successfully loaded %d attack signatures from '%s'.\n\n", sig_count, sig_file);
 
-    /* Step 2: Choose algorithm at runtime (interactive prompt or CLI argument) */
+    /* Step 2: Choose algorithm or benchmark mode at runtime (interactive prompt or CLI argument) */
     AlgorithmType algo = choose_algorithm(argc, argv);
 
-    /* Step 3: Scan web server logs against the signatures using the chosen algorithm */
-    scan_logs(log_file, signatures, sig_count, algo);
+    /* Step 3: Scan web server logs against the signatures using the chosen algorithm / mode */
+    if (algo == ALGO_BENCHMARK) {
+        run_benchmark(signatures, sig_count);
+    } else if (algo == ALGO_WORST_CASE) {
+        run_worst_case_benchmark();
+    } else {
+        scan_logs(log_file, signatures, sig_count, algo);
+    }
 
     return 0;
 }
