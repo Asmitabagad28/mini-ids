@@ -15,6 +15,12 @@
  *     - Attack type (e.g., SQL_INJECTION, XSS, PATH_TRAVERSAL)
  *     - Matched pattern
  *
+ *   It also includes an extra detector that is NOT signature based:
+ *     4. Brute-Force Login Detection - counts the failed logins
+ *        ("POST /login" with HTTP status 401) per IP address using a
+ *        hash table with chaining, and alerts on IPs that reach the
+ *        threshold (5 or more failed attempts).
+ *
  * Designed for students: Simple, modular, and well-commented.
  * ============================================================================
  */
@@ -541,8 +547,9 @@ typedef enum {
     ALGO_NAIVE = 1,
     ALGO_KMP = 2,
     ALGO_RABIN_KARP = 3,
-    ALGO_BENCHMARK = 4,
-    ALGO_WORST_CASE = 5
+    ALGO_LOGIN_BRUTE_FORCE = 4,  /* Brute-force login detection (hash table) */
+    ALGO_BENCHMARK = 5,
+    ALGO_WORST_CASE = 6
 } AlgorithmType;
 
 /*
@@ -572,8 +579,9 @@ int string_equals_ignore_case(const char *s1, const char *s2) {
  *      ./mini_ids naive        or   ./mini_ids 1
  *      ./mini_ids kmp          or   ./mini_ids 2
  *      ./mini_ids rabin-karp   or   ./mini_ids 3
- *      ./mini_ids benchmark    or   ./mini_ids 4
- *      ./mini_ids worstcase    or   ./mini_ids 5
+ *      ./mini_ids brute-force  or   ./mini_ids 4
+ *      ./mini_ids benchmark    or   ./mini_ids 5
+ *      ./mini_ids worstcase    or   ./mini_ids 6
  * 2. Interactive runtime menu:
  *      If no argument is given, it asks the user to choose.
  */
@@ -595,13 +603,20 @@ AlgorithmType choose_algorithm(int argc, char *argv[]) {
             return ALGO_RABIN_KARP;
         }
         if (strcmp(argv[1], "4") == 0 ||
+            string_equals_ignore_case(argv[1], "brute-force") ||
+            string_equals_ignore_case(argv[1], "bruteforce") ||
+            string_equals_ignore_case(argv[1], "login") ||
+            string_equals_ignore_case(argv[1], "bf")) {
+            return ALGO_LOGIN_BRUTE_FORCE;
+        }
+        if (strcmp(argv[1], "5") == 0 ||
             string_equals_ignore_case(argv[1], "benchmark") ||
             string_equals_ignore_case(argv[1], "--benchmark") ||
             string_equals_ignore_case(argv[1], "-b") ||
             string_equals_ignore_case(argv[1], "bench")) {
             return ALGO_BENCHMARK;
         }
-        if (strcmp(argv[1], "5") == 0 ||
+        if (strcmp(argv[1], "6") == 0 ||
             string_equals_ignore_case(argv[1], "worstcase") ||
             string_equals_ignore_case(argv[1], "worst-case") ||
             string_equals_ignore_case(argv[1], "--worstcase") ||
@@ -621,9 +636,10 @@ AlgorithmType choose_algorithm(int argc, char *argv[]) {
         printf("  [1] Naive String Matching Algorithm\n");
         printf("  [2] Knuth-Morris-Pratt (KMP) Algorithm with LPS Table\n");
         printf("  [3] Rabin-Karp Algorithm with Rolling Hash\n");
-        printf("  [4] Benchmark Mode (Log files 1K to 1M lines)\n");
-        printf("  [5] Worst-Case Benchmark Mode (Text of repeating 'A's + pattern 'A...AB')\n");
-        printf("Enter your choice (1, 2, 3, 4, or 5): ");
+        printf("  [4] Brute-Force Login Detection (Hash Table with Chaining)\n");
+        printf("  [5] Benchmark Mode (Log files 1K to 1M lines)\n");
+        printf("  [6] Worst-Case Benchmark Mode (Text of repeating 'A's + pattern 'A...AB')\n");
+        printf("Enter your choice (1, 2, 3, 4, 5, or 6): ");
         fflush(stdout);
 
         if (fgets(input, sizeof(input), stdin) == NULL) {
@@ -646,12 +662,18 @@ AlgorithmType choose_algorithm(int argc, char *argv[]) {
                    string_equals_ignore_case(input, "rk")) {
             return ALGO_RABIN_KARP;
         } else if (strcmp(input, "4") == 0 ||
+                   string_equals_ignore_case(input, "brute-force") ||
+                   string_equals_ignore_case(input, "bruteforce") ||
+                   string_equals_ignore_case(input, "login") ||
+                   string_equals_ignore_case(input, "bf")) {
+            return ALGO_LOGIN_BRUTE_FORCE;
+        } else if (strcmp(input, "5") == 0 ||
                    string_equals_ignore_case(input, "benchmark") ||
                    string_equals_ignore_case(input, "--benchmark") ||
                    string_equals_ignore_case(input, "-b") ||
                    string_equals_ignore_case(input, "bench")) {
             return ALGO_BENCHMARK;
-        } else if (strcmp(input, "5") == 0 ||
+        } else if (strcmp(input, "6") == 0 ||
                    string_equals_ignore_case(input, "worstcase") ||
                    string_equals_ignore_case(input, "worst-case") ||
                    string_equals_ignore_case(input, "--worstcase") ||
@@ -660,9 +682,316 @@ AlgorithmType choose_algorithm(int argc, char *argv[]) {
                    string_equals_ignore_case(input, "wc")) {
             return ALGO_WORST_CASE;
         } else {
-            printf("Invalid selection \"%s\". Please enter 1, 2, 3, 4, or 5.\n\n", input);
+            printf("Invalid selection \"%s\". Please enter 1, 2, 3, 4, 5, or 6.\n\n", input);
         }
     }
+}
+
+/*
+ * ============================================================================
+ * Brute-Force Login Detection (Hash Table with Chaining)
+ * ============================================================================
+ * This detector looks for a completely different kind of threat than the
+ * signature-based one above: a "brute-force login" attack, where the SAME
+ * IP address keeps trying to log in and keeps getting rejected.
+ *
+ * Detection rule:
+ *   A log line counts as a failed login when the request is "POST /login"
+ *   AND the HTTP status code is 401 (Unauthorized).
+ *
+ * Counting method:
+ *   The IP address of every failed attempt is stored in a hash table that
+ *   uses CHAINING to resolve collisions:
+ *     - buckets[] is a fixed-size array of bucket heads (pointers).
+ *     - each bucket points to a linked list of IpNode entries.
+ *     - if two different IPs land in the same bucket, the second one is
+ *       simply chained onto the same list.
+ *   Afterwards every IP whose failed-login counter reached the threshold
+ *   (5 or more) is reported as a possible brute-force attacker.
+ * ============================================================================
+ */
+#define HASH_TABLE_SIZE 64          /* Number of buckets (a power of 2)     */
+#define MAX_IP_LEN 32                /* Maximum characters in an IP address  */
+#define FAILED_LOGIN_THRESHOLD 5     /* Failed logins needed to raise alert */
+
+/*
+ * One entry of a chain: a single IP address and its failed-login counter.
+ */
+typedef struct IpNode {
+    char ip[MAX_IP_LEN];
+    int failed_logins;
+    struct IpNode *next;   /* Next IP in the same bucket (the chain link) */
+} IpNode;
+
+/*
+ * The hash table: an array of buckets, where every bucket holds the head
+ * of a linked list of IpNode entries.
+ */
+typedef struct {
+    IpNode *buckets[HASH_TABLE_SIZE];
+    int ip_count;         /* Number of distinct IP addresses tracked    */
+    int failed_total;     /* Total failed login attempts seen in file   */
+} IpHashTable;
+
+/*
+ * Function: hash_ip
+ * -----------------
+ * Simple string hash: multiply by 31 and add each character.
+ * The final value is reduced modulo the number of buckets.
+ */
+unsigned int hash_ip(const char *ip) {
+    unsigned int hash = 0;
+    while (*ip != '\0') {
+        hash = hash * 31u + (unsigned char)(*ip);
+        ip++;
+    }
+    return hash % HASH_TABLE_SIZE;
+}
+
+/*
+ * Function: is_failed_login_line
+ * ------------------------------
+ * Returns 1 if the log line describes a FAILED login attempt, i.e.
+ *   - the request field is "POST /login", and
+ *   - the HTTP status code right after the request is 401.
+ * Example line:
+ *   203.0.113.7 - - [...] "POST /login HTTP/1.1" 401 512
+ */
+int is_failed_login_line(const char *line) {
+    /* Find the opening quote of the request field */
+    const char *request = strstr(line, "\"POST /login");
+    if (request == NULL) {
+        return 0;
+    }
+
+    /* Find the closing quote of the request field */
+    const char *close_quote = strchr(request + 1, '"');
+    if (close_quote == NULL) {
+        return 0;
+    }
+
+    /* Skip the spaces between the closing quote and the status code */
+    const char *status = close_quote + 1;
+    while (*status == ' ') {
+        status++;
+    }
+
+    /* 401 = Unauthorized, so the login attempt was rejected */
+    return (strncmp(status, "401", 3) == 0);
+}
+
+/*
+ * Function: extract_ip_address
+ * ----------------------------
+ * Copies the IP address (the first field of a log line) into 'out'.
+ */
+void extract_ip_address(const char *line, char *out, size_t out_size) {
+    size_t i = 0;
+    while (line[i] != '\0' && line[i] != ' ' && i + 1 < out_size) {
+        out[i] = line[i];
+        i++;
+    }
+    out[i] = '\0';
+}
+
+/*
+ * Function: hash_table_find_or_add
+ * --------------------------------
+ * Looks for an IP address inside the hash table.
+ *   - If it is already stored, its node is returned so the counter can
+ *     be increased.
+ *   - If it is not stored yet, a new node is created and chained onto the
+ *     front of the list of the matching bucket.
+ * Returns NULL only when memory could not be allocated.
+ */
+IpNode *hash_table_find_or_add(IpHashTable *table, const char *ip) {
+    unsigned int index = hash_ip(ip);
+
+    /* Walk the chain of this bucket and look for the IP */
+    IpNode *node = table->buckets[index];
+    while (node != NULL) {
+        if (strcmp(node->ip, ip) == 0) {
+            return node;   /* Already known */
+        }
+        node = node->next;
+    }
+
+    /* Not found -> create a new node and chain it into the bucket */
+    node = (IpNode *)malloc(sizeof(IpNode));
+    if (node == NULL) {
+        return NULL;
+    }
+    strncpy(node->ip, ip, MAX_IP_LEN - 1);
+    node->ip[MAX_IP_LEN - 1] = '\0';
+    node->failed_logins = 0;
+    node->next = table->buckets[index];   /* Chaining: link to the old head */
+    table->buckets[index] = node;         /* New node becomes the new head */
+    table->ip_count++;
+    return node;
+}
+
+/*
+ * Function: free_ip_hash_table
+ * -----------------------------
+ * Releases every node of every chain (keeps the program free of leaks).
+ */
+void free_ip_hash_table(IpHashTable *table) {
+    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
+        IpNode *node = table->buckets[i];
+        while (node != NULL) {
+            IpNode *next = node->next;
+            free(node);
+            node = next;
+        }
+        table->buckets[i] = NULL;
+    }
+    table->ip_count = 0;
+    table->failed_total = 0;
+}
+
+/*
+ * Function: collect_failed_logins
+ * --------------------------------
+ * Reads the log file line by line and fills the hash table with the number
+ * of failed logins per IP address.
+ * Returns the total number of failed login attempts found, or -1 on error.
+ */
+int collect_failed_logins(const char *filename, IpHashTable *table) {
+    FILE *file = fopen(filename, "r");
+    if (file == NULL) {
+        printf("Error: Could not open log file '%s'\n", filename);
+        return -1;
+    }
+
+    char line[MAX_LINE_LEN];
+    int total = 0;
+
+    while (fgets(line, sizeof(line), file) != NULL) {
+        strip_newline(line);
+
+        /* Keep only "POST /login" requests that were rejected with 401 */
+        if (!is_failed_login_line(line)) {
+            continue;
+        }
+
+        /* The IP address is the first field of the line */
+        char ip[MAX_IP_LEN];
+        extract_ip_address(line, ip, sizeof(ip));
+        if (ip[0] == '\0') {
+            continue;
+        }
+
+        /* Find or create the entry for this IP and bump its counter */
+        IpNode *node = hash_table_find_or_add(table, ip);
+        if (node != NULL) {
+            node->failed_logins++;
+            table->failed_total++;
+            total++;
+        }
+    }
+
+    fclose(file);
+    return total;
+}
+
+/*
+ * Function: count_suspicious_ips
+ * ------------------------------
+ * Counts how many IP addresses reached the failed-login threshold.
+ */
+int count_suspicious_ips(const IpHashTable *table) {
+    int suspicious = 0;
+    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
+        for (IpNode *node = table->buckets[i]; node != NULL; node = node->next) {
+            if (node->failed_logins >= FAILED_LOGIN_THRESHOLD) {
+                suspicious++;
+            }
+        }
+    }
+    return suspicious;
+}
+
+/*
+ * Function: print_brute_force_alerts
+ * ----------------------------------
+ * Prints an alert for every IP address that made at least
+ * FAILED_LOGIN_THRESHOLD failed login attempts.
+ * Returns the number of alerts printed.
+ */
+int print_brute_force_alerts(const IpHashTable *table) {
+    int alerts = 0;
+    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
+        for (IpNode *node = table->buckets[i]; node != NULL; node = node->next) {
+            if (node->failed_logins >= FAILED_LOGIN_THRESHOLD) {
+                printf("[BRUTE-FORCE ALERT] IP: %-15s | Failed logins: %d | Possible brute-force login attack!\n",
+                       node->ip, node->failed_logins);
+                alerts++;
+            }
+        }
+    }
+    return alerts;
+}
+
+/*
+ * Function: detect_brute_force_logins
+ * -----------------------------------
+ * The full report used by menu option 4:
+ *   1. builds the hash table of failed logins per IP address,
+ *   2. prints an alert for every IP that reached the threshold,
+ *   3. prints a short summary of the run.
+ * Returns the number of suspicious IPs found.
+ */
+int detect_brute_force_logins(const char *filename) {
+    IpHashTable table;
+    memset(&table, 0, sizeof(table));   /* Start with all buckets empty */
+
+    printf("\n======================================================================\n");
+    printf("                BRUTE-FORCE LOGIN DETECTION (Hash Table)               \n");
+    printf("======================================================================\n");
+    printf("Log file              : %s\n", filename);
+    printf("Failed-login rule     : request \"POST /login\" with HTTP status 401\n");
+    printf("Alert threshold       : %d or more failed logins from the same IP\n",
+           FAILED_LOGIN_THRESHOLD);
+    printf("---------------------------------------------------------------------\n");
+
+    int total_failed = collect_failed_logins(filename, &table);
+    if (total_failed < 0) {
+        return 0;   /* The log file could not be read */
+    }
+
+    int alerts = print_brute_force_alerts(&table);
+
+    printf("---------------------------------------------------------------------\n");
+    printf("Failed login attempts : %d\n", total_failed);
+    printf("Distinct IPs tracked  : %d\n", table.ip_count);
+    printf("Suspicious IPs         : %d\n", alerts);
+    if (alerts == 0) {
+        printf("No brute-force login attack detected.\n");
+    }
+    printf("======================================================================\n");
+
+    free_ip_hash_table(&table);
+    return alerts;
+}
+
+/*
+ * Function: count_brute_force_suspects
+ * ------------------------------------
+ * Quiet variant of detect_brute_force_logins(): it only counts the
+ * suspicious IPs, so the result can be shown in the final scan summary
+ * without printing the same alerts twice.
+ */
+int count_brute_force_suspects(const char *filename) {
+    IpHashTable table;
+    memset(&table, 0, sizeof(table));
+
+    if (collect_failed_logins(filename, &table) < 0) {
+        return 0;
+    }
+
+    int suspicious = count_suspicious_ips(&table);
+    free_ip_hash_table(&table);
+    return suspicious;
 }
 
 /*
@@ -736,6 +1065,9 @@ void scan_logs(const char *filename, Signature signatures[], int signature_count
 
     fclose(file);
 
+    /* Run the brute-force login detector so its result can be shown below */
+    int suspicious_ips = count_brute_force_suspects(filename);
+
     /* Print scan summary */
     printf("======================================================================\n");
     printf("Scan Complete!\n");
@@ -747,6 +1079,8 @@ void scan_logs(const char *filename, Signature signatures[], int signature_count
         printf("  Hash modulus (q)    : %lld\n", (long long)RK_PRIME);
         printf("  Spurious hash hits  : %d (hash matches that turned out not to be real matches)\n", spurious_hits);
     }
+    printf("  Brute-force logins  : %d suspicious IP(s) with >= %d failed logins\n",
+           suspicious_ips, FAILED_LOGIN_THRESHOLD);
     printf("======================================================================\n");
 }
 
@@ -1218,7 +1552,9 @@ int main(int argc, char *argv[]) {
     AlgorithmType algo = choose_algorithm(argc, argv);
 
     /* Step 3: Scan web server logs against the signatures using the chosen algorithm / mode */
-    if (algo == ALGO_BENCHMARK) {
+    if (algo == ALGO_LOGIN_BRUTE_FORCE) {
+        detect_brute_force_logins(log_file);
+    } else if (algo == ALGO_BENCHMARK) {
         run_benchmark(signatures, sig_count);
     } else if (algo == ALGO_WORST_CASE) {
         run_worst_case_benchmark();
